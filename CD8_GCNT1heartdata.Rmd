@@ -1,0 +1,233 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r Load Packages}
+library(tidyverse)
+library(Seurat)
+library(patchwork)
+library(SingleR)
+library(celldex)
+library(pheatmap)
+
+# Speeds up scTransform
+#BiocManager::install("glmGamPoi")
+```
+
+```{r}
+# Load AR and Tol datasets
+AR_data <- CreateSeuratObject(Read10X(data.dir = "~/Desktop/R_projects/Dr_Krummey_Lab/heartTransplant_data/GSE262851_RAW/AR/"), min.cells = 3, min.features = 200)
+AR_data$condition <-  "AR"
+AR_data <- PercentageFeatureSet(AR_data, pattern = "^mt-", col.name = "percent.mt")
+
+VlnPlot(AR_data, features = c("nCount_RNA", "nFeature_RNA", "percent.mt"))
+# I filtered a bit looser, nFeatureRNA > 5000 vs 2500, percent.mt < 15 vs 5
+AR_data <- subset(AR_data, subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 15)
+VlnPlot(AR_data, features = c("nCount_RNA", "nFeature_RNA", "percent.mt"))
+
+Tol_data <- CreateSeuratObject(Read10X(data.dir = "~/Desktop/R_projects/Dr_Krummey_Lab/heartTransplant_data/GSE262851_RAW/Tol/"), min.cells = 3, min.features = 200)
+Tol_data$condition <- "Tol"
+Tol_data <- PercentageFeatureSet(Tol_data, pattern = "^mt-", col.name = "percent.mt")
+VlnPlot(Tol_data, features = c("nCount_RNA", "nFeature_RNA", "percent.mt"))
+Tol_data <- subset(Tol_data, subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 15)
+VlnPlot(Tol_data, features = c("nCount_RNA", "nFeature_RNA", "percent.mt"))
+
+# Lets merge asap so we know the same transformations are applied
+# Project is just a label to group the merged datasets and I never reference it. Feel free to change!
+data.merge <- merge(AR_data, Tol_data, add.cell.ids = c("AR", "Tol"), project = "Heart")
+```
+
+```{r}
+# SCTransform instead of normalize -> variable features -> scale. More up-to-date
+data.merge <- SCTransform(data.merge, vars.to.regress = "percent.mt", verbose = FALSE)
+data.merge <- RunPCA(data.merge, verbose = FALSE)
+
+# dims of PCA to choose. Probably some fine tuning here for dims and number of neighbors, but I think it looks fine enough already
+# It is always good to be thinking whether you are overfitting or underfitting data though!
+data.merge = FindNeighbors(data.merge, dims = 1:30, reduction = "pca")
+data.merge = FindClusters(data.merge, resolution = 0.5, cluster.name = "unintegrated_clusters")
+data.merge <- RunUMAP(data.merge, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated", verbose = FALSE)
+
+# Always visualize!
+# The plot is showing batch effects, so we definitely need to integrate
+DimPlot(data.merge, reduction = "umap.unintegrated", group.by = c("condition", "unintegrated_clusters"), combine = FALSE)
+```
+
+```{r}
+# Now we integrate the two layers using the Harmony algorithm with the PCA we calculated 
+data.integrated <- IntegrateLayers(object = data.merge, method = HarmonyIntegration, orig.reduction = "pca", new.reduction = "harmony", normalization.method = "SCT", verbose = FALSE)
+```
+
+```{r}
+# After integrating we re-find our neighbors and clusters and run UMAP to check our batch effects visually
+data.integrated <- FindNeighbors(data.integrated, reduction = "harmony", dims = 1:30)
+data.integrated <- FindClusters(data.integrated, resolution = 0.5, cluster.name = "harmony_clusters")
+data.integrated <- RunUMAP(data.integrated, reduction = "harmony", dims = 1:30, reduction.name = "umap.harmony", verbose = FALSE)
+
+# Much nicer, AR and TOL form well-mixed clusters
+DimPlot(data.integrated, reduction = "umap.harmony", group.by = c("condition", "harmony_clusters"), combine = FALSE)
+```
+
+
+```{r}
+# I would suggest looking into Azimuth instead of SingleR. Better fine labeling
+ref <- celldex::ImmGenData()
+```
+
+```{r}
+data.integrated_fine_pred <- SingleR(test = GetAssayData(data.integrated, layer = 'counts'), 
+                   ref = ref, 
+                   labels = ref$label.fine)
+
+data.integrated_main_pred <- SingleR(test = GetAssayData(data.integrated, layer = 'counts'), 
+                   ref = ref, 
+                   labels = ref$label.main)
+data.integrated$singleR.labels.fine <- data.integrated_fine_pred$labels[match(rownames(data.integrated@meta.data), rownames(data.integrated_fine_pred))]
+
+data.integrated$singleR.labels.main <- data.integrated_main_pred$labels[match(rownames(data.integrated@meta.data), rownames(data.integrated_main_pred))]
+```
+
+```{r}
+DimPlot(data.integrated, reduction = "umap.harmony", group.by = "singleR.labels.main")
+DimPlot(data.integrated, reduction = "umap.harmony", group.by = "singleR.labels.fine")
+```
+
+```{r}
+head(sort(table(data.integrated_fine_pred$labels), decreasing=TRUE))
+
+head(sort(table(data.integrated_main_pred$labels), decreasing=TRUE))
+# 826 T cells
+```
+
+```{r}
+# Finding more ways to plot our results, checking annotation of cells and pruned cells
+plotScoreHeatmap(data.integrated_main_pred)
+plotDeltaDistribution(data.integrated_main_pred)
+```
+
+```{r}
+pattern <- "T cells \\(T\\.(8|CD8).*\\)"
+# Shorter way to add metadata
+data.integrated$is_cd8 <- grepl(pattern, data.integrated@meta.data$singleR.labels.fine)
+DimPlot(data.integrated, reduction = "umap.harmony", group.by = "is_cd8")
+
+cd8_subset <- subset(data.integrated, subset = is_cd8 == TRUE)
+```
+
+
+
+```{r}
+# Rerun SCTransform on the subset, since the global structure of variance changed 
+cd8_subset <- SCTransform(cd8_subset, vars.to.regress = "percent.mt", verbose = FALSE)
+
+# Sub-clustering of CD8 cells
+cd8_subset <- RunPCA(cd8_subset, reduction.name = "cd8.pca", verbose = FALSE)
+cd8_subset <- FindNeighbors(cd8_subset, reduction = "cd8.pca", dims = 1:30)
+cd8_subset <- FindClusters(cd8_subset, resolution = 0.5, cluster.name = "cd8_clusters")
+cd8_subset <- RunUMAP(cd8_subset, dims = 1:30, reduction = "cd8.pca", verbose = FALSE, reduction.name = "cd8.umap")
+DimPlot(cd8_subset, reduction = "cd8.umap", group.by = c("condition", "cd8_clusters"), combine = FALSE)
+```
+
+
+```{r}
+# Finding DE genes
+Idents(cd8_subset) <- "cd8_clusters"
+cd8_subset <- PrepSCTFindMarkers(cd8_subset)
+tcell.cd8.markers <- FindMarkers(cd8_subset, ident.1 = 0, ident.2 = 2)
+
+tcell.cd8.markers
+```
+
+```{r}
+FeaturePlot(cd8_subset, features = "Gcnt1", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Gzmb", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Spn", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Sell", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Prf1", reduction = "cd8.umap")
+```
+```{r}
+FeaturePlot(cd8_subset, features = "Spn", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Cxcr3", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Havcr2", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Ifng", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Icos", reduction = "cd8.umap")
+```
+
+
+```{r}
+FeaturePlot(cd8_subset, features = "Prdm1", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Tox", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Gzmk", reduction = "cd8.umap")
+#FeaturePlot(cd8_subset, features = "Gbma", reduction = "cd8.umap") NOT FOUND
+#FeaturePlot(cd8_subset, features = "Gzmh", reduction = "cd8.umap") NOT FOUND
+
+```
+
+
+```{r}
+FeaturePlot(cd8_subset, features = "Gzmb", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Lag3", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Tigit", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Irf4", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Tcf7", reduction = "cd8.umap")
+```
+
+
+```{r}
+FeaturePlot(cd8_subset, features = "Pdcd1", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Tnf", reduction = "cd8.umap")
+FeaturePlot(cd8_subset, features = "Tbx21", reduction = "cd8.umap")
+```
+
+
+#Save the plots as PNGs
+
+
+library(ggplot2)
+
+# List genes (remove genes that were not found)
+genes <- c("Gcnt1", "Gzmb", "Spn", "Sell", "Prf1", "Cxcr3", "Havcr2", "Ifng", "Icos",
+           "Prdm1", "Tox", "Gzmk", "Lag3", "Tigit", "Irf4", "Tcf7", 
+           "Pdcd1", "Tnf", "Tbx21")
+
+# Loop through the genes and create/save plots
+for (gene in genes) {
+  plot <- FeaturePlot(cd8_subset, features = gene, reduction = "cd8.umap")
+  ggsave(filename = paste0("CD8_", gene, ".png"), plot = plot, width = 6, height = 4, dpi = 300)
+}
+
+
+
+# From the list Dr. Krummey sent, find the differential expression of the genes of interest
+
+
+# Look back to just NON-CD4 T cells to see if there is a difference in that and solely using/looking at CD8+ T cells
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
