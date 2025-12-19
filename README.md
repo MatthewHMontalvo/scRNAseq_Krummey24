@@ -22,14 +22,14 @@ This project analyzes single-cell RNA-seq data from heart transplant samples to 
 
 **Workflow Summary**
 
--Quality control and filtering of single cells
+1. Quality control and filtering of single cells
 
--Normalization and scaling
+2. Normalization and scaling
 
--Dimensionality reduction (PCA, UMAP)
+3. Dimensionality reduction (PCA, UMAP)
 
--Cell clustering and annotation
+4. Cell clustering and annotation
 
--Subsetting immune populations (e.g., CD8⁺ T cells)
+5. Subsetting immune populations (e.g., CD8⁺ T cells)
 
--Differential expression and pathway-level interpretation
+6. Differential expression and pathway-level interpretation
